@@ -2173,6 +2173,7 @@ func execute(gp *g, inheritTime bool) {
 
 // Finds a runnable goroutine to execute.
 // Tries to steal from other P's, get g from global queue, poll network.
+// 解答了之前的一个问题，本质上没有一个调度器对象，就是直接运行，就能直接实现调度
 func findrunnable() (gp *g, inheritTime bool) {
 	_g_ := getg()
 
@@ -2199,11 +2200,13 @@ top:
 	}
 
 	// local runq
+	//~ 局部队列
 	if gp, inheritTime := runqget(_p_); gp != nil {
 		return gp, inheritTime
 	}
 
 	// global runq
+	//~全局队列
 	if sched.runqsize != 0 {
 		lock(&sched.lock)
 		gp := globrunqget(_p_, 0)
@@ -2250,6 +2253,7 @@ top:
 		_g_.m.spinning = true
 		atomic.Xadd(&sched.nmspinning, 1)
 	}
+	//~ 偷四次
 	for i := 0; i < 4; i++ {
 		for enum := stealOrder.start(fastrand()); !enum.done(); enum.next() {
 			if sched.gcwaiting != 0 {
