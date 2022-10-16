@@ -363,6 +363,7 @@ type maptype struct {
 	elem       *_type
 	bucket     *_type // internal type representing a hash bucket
 	keysize    uint8  // size of key slot
+	//~就是value
 	elemsize   uint8  // size of elem slot
 	bucketsize uint16 // size of bucket
 	flags      uint32

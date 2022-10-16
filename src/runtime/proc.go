@@ -18,17 +18,20 @@ var modinfo string
 
 // Goroutine scheduler
 // The scheduler's job is to distribute ready-to-run goroutines over worker threads.
-//
+///*distribute 分布式是这个词，这里是分发分配的意思*/
+
 // The main concepts are:
 // G - goroutine.
 // M - worker thread, or machine.
 // P - processor, a resource that is required to execute Go code.
 //     M must have an associated P to execute Go code, however it can be
 //     blocked or in a syscall w/o an associated P.
-//
+///*M必须有一个相关P才能运行go代码，但是M没有关联p的时候，可以被阻塞 或者 陷入系统调用
+// w/o 等于without */
+
 // Design doc at https://golang.org/s/go11sched.
 
-// Worker thread parking/unparking.
+// Worker thread parking/unparking. /*工作线程的存入取出*/
 // We need to balance between keeping enough running worker threads to utilize
 // available hardware parallelism and parking excessive running worker threads
 // to conserve CPU resources and power. This is not simple for two reasons:
@@ -37,6 +40,18 @@ var modinfo string
 // (2) for optimal thread management we would need to know the future (don't park
 // a worker thread when a new goroutine will be readied in near future).
 //
+/*
+park：停止。停车
+unpark：启动，开车走
+
+
+park thread就是存入线程，进一步抽象为放弃一个线程，销毁一个线程
+
+平衡，1保存足够的运行线程来利用硬件并行 2 暂停过多的运行线程来实现节约cpu资源。 不容易由于2个原因，
+1调度状态是故意做成了分布式的（尤其是每个P的局部队列）所以不可能快速计算一个全局的断言 2 最佳线程管理器 应该知道未来
+（如果马上有个新的G来运行，暂时不要暂停当前正在运行的空线程）
+*/
+
 // Three rejected approaches that would work badly:
 // 1. Centralize all scheduler state (would inhibit scalability).
 // 2. Direct goroutine handoff. That is, when we ready a new goroutine and there
@@ -50,6 +65,15 @@ var modinfo string
 //    unparking as the additional threads will instantly park without discovering
 //    any work to do.
 //
+/*三个被驳回的方法，很糟糕
+1 计算全局调度状态（会抑制扩展性）
+2 直接G 放手。有个新G，空闲的P。那么出一个M，来处理这个G。这将会导致线程状态的颠覆。因为为这个G准备的线程，可能随时空闲失业，
+那就又需要放回线程。【就是有工作就取出一个线程，没工作就放回线程，这样很来来回回的变化】
+另外，这还会破坏局部性。希望保留依赖的G在一个线程里面。也引入了另外的延时
+3 取出另外的线程，当有G准备好时，有空闲P时，但是不接力让新的M处理。这样导致过多的线程存取，另外的线程马上存回了 没有发现任何工作
+【这种是有啥意义，弱智？纯做对比】
+*/
+
 // The current approach:
 // We unpark an additional thread when we ready a goroutine if (1) there is an
 // idle P and there are no "spinning" worker threads. A worker thread is considered
@@ -67,6 +91,21 @@ var modinfo string
 // This approach smooths out unjustified spikes of thread unparking,
 // but at the same time guarantees eventual maximal CPU parallelism utilization.
 //
+/*
+spinning 快速旋转，空转，自旋
+
+当有一个准备好的G，如果有空闲的P和没有自旋的M，我们取出一个另外的线程，
+定义自旋：如果一个线程自旋，那么他局部队里没有工作，没有在全局队列找到工作。
+自旋的状态被表示，在m.spinning和sched.nmspinning变量里
+这种方式取出的线程被认为是自旋的。
+我们不会传递G这样M不会马上工作，自旋M一边保持自旋，一个看看其他P的局部队列有没有工作，在放回之前。
+如果找到工作，就退出自旋状态，并去执行。如果没有找到，退出自旋状态并放回。
+
+如果有自旋M，那么就不会拿出一个新M，当有G准备好时。为了补偿这个点，配合这个点，实现这个点，如果最后一个自旋线程停止自旋时，
+这个M必须启动一个新的自旋M。【始终有一个自旋的线程在等工作，浪费一点就浪费一点。但是会不会一直偷取G，这样没法一直自旋？】
+这个方法，平滑掉线程停止时的不合理的钉子，同时保证了最终的最大的cpu并行利用
+*/
+
 // The main implementation complication is that we need to be very careful during
 // spinning->non-spinning thread transition. This transition can race with submission
 // of a new goroutine, and either one part or another needs to unpark another worker
@@ -78,7 +117,13 @@ var modinfo string
 // Note that all this complexity does not apply to global run queue as we are not
 // sloppy about thread unparking when submitting to global queue. Also see comments
 // for nmspinning manipulation.
-
+/*
+主要实现的难题，要特别注意自旋到非自旋的线程转换。这个转换可能和提交新的G来竞争，还有启动新的工作线程
+如果都失败了，结束，以半持续CPU未充分利用
+新G准备好的通用模式，提交到局部队里，
+自旋到非自旋转换的通用模式，缩减nmspinning，去所有P的局部队列找新的工作
+注意这些复杂性不应用于全局队列，因为我们不是草率的启动线程当提交到全局队里的时候【不懂】
+*/
 var (
 	m0           m
 	g0           g
@@ -2518,6 +2563,7 @@ top:
 		// Check the global runnable queue once in a while to ensure fairness.
 		// Otherwise two goroutines can completely occupy the local runqueue
 		// by constantly respawning each other.
+		//~为了公平，每61次调度，就从全局队列里面取g，因为全局队列里面的g也要运行不能忘了他们
 		if _g_.m.p.ptr().schedtick%61 == 0 && sched.runqsize > 0 {
 			lock(&sched.lock)
 			gp = globrunqget(_g_.m.p.ptr(), 1)
@@ -2525,12 +2571,14 @@ top:
 		}
 	}
 	if gp == nil {
+		//~从本地队列取
 		gp, inheritTime = runqget(_g_.m.p.ptr())
 		if gp != nil && _g_.m.spinning {
 			throw("schedule: spinning with local work")
 		}
 	}
 	if gp == nil {
+		//~ 集中三种取g的逻辑
 		gp, inheritTime = findrunnable() // blocks until work is available
 	}
 
@@ -4839,7 +4887,7 @@ func runqputslow(_p_ *p, gp *g, h, t uint32) bool {
 	return true
 }
 
-// Get g from local runnable queue.
+// ~ Get g from local runnable queue. 从本地队列找g
 // If inheritTime is true, gp should inherit the remaining time in the
 // current time slice. Otherwise, it should start a new time slice.
 // Executed only by the owner P.
@@ -4850,6 +4898,7 @@ func runqget(_p_ *p) (gp *g, inheritTime bool) {
 		if next == 0 {
 			break
 		}
+		//~为什么要设置为0
 		if _p_.runnext.cas(next, 0) {
 			return next.ptr(), true
 		}
@@ -4862,6 +4911,7 @@ func runqget(_p_ *p) (gp *g, inheritTime bool) {
 			return nil, false
 		}
 		gp := _p_.runq[h%uint32(len(_p_.runq))].ptr()
+		//~ 头的idx加1。 先忽略原子操作的部分，看主干
 		if atomic.CasRel(&_p_.runqhead, h, h+1) { // cas-release, commits consume
 			return gp, false
 		}
@@ -4872,11 +4922,17 @@ func runqget(_p_ *p) (gp *g, inheritTime bool) {
 // Batch is a ring buffer starting at batchHead.
 // Returns number of grabbed goroutines.
 // Can be executed by any P.
+// 从 _p_ 批量获取可运行 goroutine，放到 batch 数组里
+// batch 是一个环，起始于 batchHead
+// 返回偷的数量，返回的 goroutine 可被任何 P 执行
 func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool) uint32 {
 	for {
+		//~头
 		h := atomic.LoadAcq(&_p_.runqhead) // load-acquire, synchronize with other consumers
+		//~尾
 		t := atomic.LoadAcq(&_p_.runqtail) // load-acquire, synchronize with the producer
 		n := t - h
+		//偷一半
 		n = n - n/2
 		if n == 0 {
 			if stealRunNextG {
@@ -4914,34 +4970,43 @@ func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool
 		if n > uint32(len(_p_.runq)/2) { // read inconsistent h and t
 			continue
 		}
+
+		// 将 g 放置到 bacth 中
 		for i := uint32(0); i < n; i++ {
 			g := _p_.runq[(h+i)%uint32(len(_p_.runq))]
 			batch[(batchHead+i)%uint32(len(batch))] = g
 		}
+		// 工作被偷走了，更新一下队列头指针
 		if atomic.CasRel(&_p_.runqhead, h, h+n) { // cas-release, commits consume
 			return n
 		}
 	}
 }
 
-// Steal half of elements from local runnable queue of p2
+//~ Steal half of elements from local runnable queue of p2 偷取
 // and put onto local runnable queue of p.
 // Returns one of the stolen elements (or nil if failed).
 func runqsteal(_p_, p2 *p, stealRunNextG bool) *g {
 	t := _p_.runqtail
+	//~实际的偷取的函数
+	//传入p的队列，p的尾部idx
 	n := runqgrab(p2, &_p_.runq, t, stealRunNextG)
 	if n == 0 {
 		return nil
 	}
 	n--
+	// 找到最后一个 g，准备返回
 	gp := _p_.runq[(t+n)%uint32(len(_p_.runq))].ptr()
 	if n == 0 {
+		// 说明只偷了一个 g
 		return gp
 	}
 	h := atomic.LoadAcq(&_p_.runqhead) // load-acquire, synchronize with consumers
 	if t-h+n >= uint32(len(_p_.runq)) {
 		throw("runqsteal: runq overflow")
 	}
+
+	// 更新队尾，将偷来的工作加入队列
 	atomic.StoreRel(&_p_.runqtail, t+n) // store-release, makes the item available for consumption
 	return gp
 }

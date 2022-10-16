@@ -18,6 +18,7 @@ import (
 	"unsafe"
 )
 
+//~ 混合写屏障
 // Go uses a hybrid barrier that combines a Yuasa-style deletion
 // barrier—which shades the object whose reference is being
 // overwritten—with Dijkstra insertion barrier—which shades the object
@@ -146,8 +147,14 @@ import (
 // remove the deletion barrier, we'll have to work out a new way to
 // handle the profile logging.
 
+
+
+
+
+
+//复制数据，从src地址复制到dst地址
 // typedmemmove copies a value of type t to dst from src.
-// Must be nosplit, see #16026.
+// Must be nosplit, see #16026. （不懂）
 //
 // TODO: Perfect for go:nosplitrec since we can't have a safe point
 // anywhere in the bulk barrier or memmove.

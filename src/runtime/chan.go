@@ -30,15 +30,29 @@ const (
 )
 
 type hchan struct {
+	//队列中的数据量
 	qcount   uint           // total data in the queue
+	//环形队列大小
 	dataqsiz uint           // size of the circular queue
+	//环形队列的实际内存位置的指针
 	buf      unsafe.Pointer // points to an array of dataqsiz elements
+	//channel中的数据类型的大小
 	elemsize uint16
 	closed   uint32
+	//channel中的数据类型
 	elemtype *_type // element type
+	//入队是放在哪
 	sendx    uint   // send index
-	recvx    uint   // receive index
+	//出队列从哪出
+	recvx    uint   // receive index、
+	//等待读消息的goroutine队列
+	//~等到从这个chan接收的go队列
 	recvq    waitq  // list of recv waiters
+	//等待写消息的goroutine队列
+	//~send就是正在向这个chan里面发送，
+	//等待向这个chan发送数据的goroutine
+	//~假设一个有2个g正在向一个满了的chan写数据，但是阻塞了，那么这两个g就在sendq里面
+	//这send的主语是外部的goroutine，不是这个chan去send
 	sendq    waitq  // list of send waiters
 
 	// lock protects all fields in hchan, as well as several
@@ -47,6 +61,7 @@ type hchan struct {
 	// Do not change another G's status while holding this lock
 	// (in particular, do not ready a G), as this can deadlock
 	// with stack shrinking.
+	//一个channel同时仅允许被一个goroutine读写
 	lock mutex
 }
 
@@ -68,6 +83,7 @@ func makechan64(t *chantype, size int64) *hchan {
 	return makechan(t, int(size))
 }
 
+//~ 创建chan
 func makechan(t *chantype, size int) *hchan {
 	elem := t.elem
 
@@ -101,6 +117,7 @@ func makechan(t *chantype, size int) *hchan {
 		c = (*hchan)(mallocgc(hchanSize+mem, nil, true))
 		c.buf = add(unsafe.Pointer(c), hchanSize)
 	default:
+		//~默认就是直接分配内存
 		// Elements contain pointers.
 		c = new(hchan)
 		c.buf = mallocgc(mem, elem, true)
@@ -139,6 +156,7 @@ func chansend1(c *hchan, elem unsafe.Pointer) {
  * been closed.  it is easiest to loop and re-run
  * the operation; we'll see that it's now closed.
  */
+//~数据写入chan。可能有几种情况，能写入，满了不能写入阻塞了，写入关闭chan panic了
 func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	if c == nil {
 		if !block {
@@ -172,6 +190,7 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	// channel wasn't closed during the first observation.
 	if !block && c.closed == 0 && ((c.dataqsiz == 0 && c.recvq.first == nil) ||
 		(c.dataqsiz > 0 && c.qcount == c.dataqsiz)) {
+		//满了
 		return false
 	}
 
@@ -180,13 +199,17 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 		t0 = cputicks()
 	}
 
+	//上锁
 	lock(&c.lock)
 
+	//写入关闭chan，炸了
 	if c.closed != 0 {
 		unlock(&c.lock)
 		panic(plainError("send on closed channel"))
 	}
 
+	//如果有正在等待从这个chan中接收数据的goroutine，那么直接发送
+	//就不用过环形数组了
 	if sg := c.recvq.dequeue(); sg != nil {
 		// Found a waiting receiver. We pass the value we want to send
 		// directly to the receiver, bypassing the channel buffer (if any).
@@ -194,18 +217,25 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 		return true
 	}
 
+	//~环形数组中有空位
+	//~也就是说这是一个有缓冲的chan
 	if c.qcount < c.dataqsiz {
 		// Space is available in the channel buffer. Enqueue the element to send.
+		//~找到存数据的位置，本质是移动指针，指向某个内存地址
 		qp := chanbuf(c, c.sendx)
 		if raceenabled {
 			raceacquire(qp)
 			racerelease(qp)
 		}
+		//~复制数据
 		typedmemmove(c.elemtype, qp, ep)
+		//~移动指针
 		c.sendx++
+		//~实现环形
 		if c.sendx == c.dataqsiz {
 			c.sendx = 0
 		}
+		//~计数+1
 		c.qcount++
 		unlock(&c.lock)
 		return true
@@ -217,6 +247,7 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	}
 
 	// Block on the channel. Some receiver will complete our operation for us.
+	//获取就是这个当前g的指针，
 	gp := getg()
 	mysg := acquireSudog()
 	mysg.releasetime = 0
@@ -227,19 +258,25 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	// on gp.waiting where copystack can find it.
 	mysg.elem = ep
 	mysg.waitlink = nil
+	//mysg本质是对当前g的一个封装
 	mysg.g = gp
 	mysg.isSelect = false
 	mysg.c = c
 	gp.waiting = mysg
 	gp.param = nil
+	//把这个go存入，发送等待队列
 	c.sendq.enqueue(mysg)
+	//~方法挂起当前 goroutine（会记录执行位置）
 	goparkunlock(&c.lock, waitReasonChanSend, traceEvGoBlockSend, 3)
 	// Ensure the value being sent is kept alive until the
 	// receiver copies it out. The sudog has a pointer to the
 	// stack object, but sudogs aren't considered as roots of the
 	// stack tracer.
+	//~方法保证待发送的数据值是活跃状态，也就是分配在堆上，避免被 GC 回收。
 	KeepAlive(ep)
 
+	//~从这里开始唤醒，并恢复阻塞的发送操作
+	//~调度器在停止 g 时会记录运行线程和方法内执行的位置
 	// someone woke us up.
 	if mysg != gp.waiting {
 		throw("G waiting list is corrupted")
@@ -415,9 +452,12 @@ func chanrecv2(c *hchan, elem unsafe.Pointer) (received bool) {
 // chanrecv receives on channel c and writes the received data to ep.
 // ep may be nil, in which case received data is ignored.
 // If block == false and no elements are available, returns (false, false).
-// Otherwise, if c is closed, zeros *ep and returns (true, false).
+// Otherwise, if c is closed, zeros *ep and returns (true, false).   从关闭的chan读，第二个参数false
 // Otherwise, fills in *ep with an element and returns (true, true).
 // A non-nil ep must point to the heap or the caller's stack.
+//~从chan取出数据，从chan接收数据
+//ep是返回数据
+//
 func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool) {
 	// raceenabled: don't need to check ep, as it is always on the stack
 	// or is new memory allocated by reflect.
@@ -470,6 +510,8 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 		return true, false
 	}
 
+	//~如果有正在等待向chan里面发数据goroutine
+	//~就直接从那边读了，给这个
 	if sg := c.sendq.dequeue(); sg != nil {
 		// Found a waiting sender. If buffer is size 0, receive value
 		// directly from sender. Otherwise, receive from head of queue
@@ -479,6 +521,7 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 		return true, true
 	}
 
+	//然后，如果此时chan里面有数据，，就取出数据
 	if c.qcount > 0 {
 		// Receive directly from queue
 		qp := chanbuf(c, c.recvx)
@@ -505,6 +548,8 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 	}
 
 	// no sender available: block on this channel.
+	//现在chan里面没数据，没有正在向chan里面发数据的g
+	//要进入阻塞状态，等待从chan接收数据，
 	gp := getg()
 	mysg := acquireSudog()
 	mysg.releasetime = 0
@@ -520,10 +565,13 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 	mysg.isSelect = false
 	mysg.c = c
 	gp.param = nil
+	//写入队列
 	c.recvq.enqueue(mysg)
 	goparkunlock(&c.lock, waitReasonChanReceive, traceEvGoBlockRecv, 3)
 
 	// someone woke us up
+	//唤醒
+	//~意义就是能继续执行下去，，不阻塞这个go
 	if mysg != gp.waiting {
 		throw("G waiting list is corrupted")
 	}

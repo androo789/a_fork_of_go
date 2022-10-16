@@ -10,7 +10,9 @@ import (
 	"unsafe"
 )
 
+//~ 切片
 type slice struct {
+	//真正存数据的数组的指针
 	array unsafe.Pointer
 	len   int
 	cap   int
@@ -31,6 +33,8 @@ func panicmakeslicecap() {
 	panic(errorString("makeslice: cap out of range"))
 }
 
+
+//新建一个slice
 func makeslice(et *_type, len, cap int) unsafe.Pointer {
 	mem, overflow := math.MulUintptr(et.size, uintptr(cap))
 	if overflow || mem > maxAlloc || len < 0 || len > cap {
@@ -73,6 +77,7 @@ func makeslice64(et *_type, len64, cap64 int64) unsafe.Pointer {
 // to calculate where to write new values during an append.
 // TODO: When the old backend is gone, reconsider this decision.
 // The SSA backend might prefer the new length or to return only ptr/cap and save stack space.
+//~cap是目标容量
 func growslice(et *_type, old slice, cap int) slice {
 	if raceenabled {
 		callerpc := getcallerpc()
@@ -102,6 +107,7 @@ func growslice(et *_type, old slice, cap int) slice {
 		} else {
 			// Check 0 < newcap to detect overflow
 			// and prevent an infinite loop.
+			//循环加0.25直到满足目标cap
 			for 0 < newcap && newcap < cap {
 				newcap += newcap / 4
 			}

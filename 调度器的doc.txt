@@ -1,0 +1,176 @@
+Scalable Go Scheduler Design Doc
+Dmitry Vyukov
+dvyukov@google.com
+May 2, 2012
+The document assumes some prior knowledge of the Go language and current goroutine scheduler implementation.
+
+Problems with current scheduler
+
+Current goroutine scheduler limits scalability of concurrent programs written in Go, in particular, high-throughput servers and parallel computational programs. Vtocc server maxes out at 70% CPU on 8-core box, while profile shows 14% is spent in runtime.futex(). In general, the scheduler may inhibit users from using idiomatic fine-grained concurrency where performance is critical.
+/*
+当前的调度器可能阻止了用户在性能关键的地方使用 习惯的细粒度的并发
+【因为并发高画在调度上的时间太长了】
+*/
+
+What's wrong with current implementation:
+
+1. Single global mutex (Sched.Lock) and centralized state. The mutex protects all goroutine-related operations (creation, completion, rescheduling, etc).
+2. Goroutine (G) hand-off (G.nextg). Worker threads (M's) frequently hand-off runnable goroutines between each other, this may lead to increased latencies and additional overheads. Every M must be able to execute any runnable G, in particular the M that just created the G.
+3. Per-M memory cache (M.mcache). Memory cache and other caches (stack alloc) are associated with all M's, while they need to be associated only with M's running Go code (an M blocked inside of syscall does not need mcache). A ratio between M's running Go code and all M's can be as high as 1:100. This leads to excessive resource consumption (each MCache can suck up up to 2M) and poor data locality.
+4. Aggressive thread blocking/unblocking. In presence of syscalls worker threads are frequently blocked and unblocked. This adds a lot of overhead.
+/*
+1 单一的全局锁，集中的状态。锁保护着所有协程相关的操作，比如创建，完成，重调度
+2 G的接力。M之间经常接力可以运行的G，导致延时增长和另外的管理费用。每个M必须有能力执行每个可运行的G，尤其是创建G的那个M。【一个G在一个M上运行，这个M创建了一个新G，这个G应该在这个M上运行】
+3 每个M的内存，变量M.mcache。内存被分配给了所有的M，但是内存他们需要被关联，仅仅关联M的运行go代码。【只分配M运行go代码的相关内存就行，但是现在太多了】
+M的运行G代码和所有M的变量比例是1：100，导致了严重的资源浪费。（每个Mcache可能吸水膨胀到2M）和可怜的数据局部性【没研究过GM调度器，我不理解】
+4 强烈的线程阻塞非阻塞。在系统调用面前的是频繁的阻塞非阻塞。导致了很多花销
+*/
+
+
+Design
+
+Processors
+
+The general idea is to introduce a notion of P (Processors) into runtime and implement work-stealing scheduler on top of Processors.
+M represents OS thread (as it is now). P represents a resource that is required to execute Go code. When M executes Go code, it has an associated P. When M is idle or in syscall, it does not need P.
+There is exactly GOMAXPROCS P’s. All P’s are organized into an array, that is a requirement of work-stealing. GOMAXPROCS change involves stop/start the world to resize array of P’s.
+Some variables from sched are de-centralized and moved to P. Some variables from M are moved to P (the ones that relate to active execution of Go code).
+/*
+总体的想法是引入一个P的概念到运行时中，实现工作偷取的调度在P层面上
+M代表系统线程。P代表资源，执行go代码的资源
+当M执行G代码的时候，M有一个相关的P
+当M空闲，或系统调用的时候，M没有P
+精确的GOMAXPROCS个P。这些P组成一个数组，为了工作偷取
+修改GOMAXPROCS会STW
+本来调度器对象的一些变量给了P
+本来M对象的一些变量给了P
+*/
+
+
+
+struct P
+{
+    Lock;
+    G *gfree; // freelist, moved from sched
+    G *ghead; // runnable, moved from sched
+    G *gtail;
+    MCache *mcache; // moved from M
+    FixAlloc *stackalloc; // moved from M
+    uint64 ncgocall;
+    GCStats gcstats;
+    // etc
+    ...
+};
+
+P *allp; // [GOMAXPROCS]
+
+There is also a lock-free list of idle P’s:
+
+P *idlep; // lock-free list
+
+When an M is willing to start executing Go code, it must pop a P form the list. When an M ends executing Go code, it pushes the P to the list. So, when M executes Go code, it necessary has an associated P. This mechanism replaces sched.atomic (mcpu/mcpumax).
+
+
+
+
+
+Scheduling
+
+When a new G is created or an existing G becomes runnable, it is pushed onto a list of runnable goroutines of current P. When P finishes executing G, it first tries to pop a G from own list of runnable goroutines; if the list is empty, P chooses a random victim (another P) and tries to steal a half of runnable goroutines from it.
+/*
+开始讲调度，
+当一个G要运行是，他被放入P的局部队列
+当前G运行完成，P弹出局部队列中的下一个G
+如果没有的话，从其他P的局部队列偷一半过来
+*/
+
+
+
+Syscalls/M Parking and Unparking
+
+When an M creates a new G, it must ensure that there is another M to execute the G (if not all M’s are already busy). Similarly, when an M enters syscall, it must ensure that there is another M to execute Go code.
+There are two options, we can either promptly block and unblock M’s, or employ some spinning. Here is inherent conflict between performance and burning unnecessary CPU cycles. The idea is to use spinning and do burn CPU cycles. However, it should not affect programs running with GOMAXPROCS=1 (command line utilities, appengine, etc).
+Spinning is two-level: (1) an idle M with an associated P spins looking for new G’s, (2) an M w/o an associated P spins waiting for available P’s. There are at most GOMAXPROCS spinning M’s (both (1) and (2)). Idle M’s of type (1) do not block while there are idle M’s of type (2).
+When a new G is spawned, or M enters syscall, or M transitions from idle to busy, it ensures that there is at least 1 spinning M (or all P’s are busy). This ensures that there are no runnable G’s that can be otherwise running; and avoids excessive M blocking/unblocking at the same time.
+Spinning is mostly passive (yield to OS, sched_yield()), but may include a little bit of active spinning (loop burnging CPU) (requires investigation and tuning).
+/*
+系统调用和M的启动停止
+
+当M创建一个新的G的时候，M必须保证有另一个M来运行G（除非所有的M都很忙）
+类似的，当M进入系统调用时，M必须保证有另一个M来运行go代码
+有2个选择，或者快速的阻塞非阻塞M ，或者雇佣一些自旋的M。
+这里有内在的冲突，在性能和燃烧非必要cpu转 之间
+想法是自旋在两个层级：1一个空闲的M，他上面有关联的P，自旋中寻找G 2 一个没有关联P的M自旋等待获取P
+最多GOMAXPROCS个自旋的M。第一种类型的空闲M不会阻塞住，当有第二种类型的空闲M时
+当一个新的G启动，或者M进入系统调用，或M从空闲转为忙碌时，这种机制保证了至少一个自旋的M（或者所有P都在忙）
+这种就保证了，没有G会以其他方式运行。避免了过多的M阻塞非阻塞在同一时间【啥意思】
+自旋主要是被动的，也有主动自旋的情况（循环燃烧cpu）（需要调查）
+*/
+
+
+Termination/Deadlock Detection
+
+Termination/deadlock detection is more problematic in a distributed system. The general idea is to do the checks only when all P’s are idle (global atomic counter of idle P’s), this allows to do more expensive checks that involve aggregation of per-P state.
+No details yet.
+/*死锁检测
+死锁检测是更困难在分布式系统。通用的想法是执行检测。什么时候执行检测，就是所有P都是空闲的时候。这将导致更昂贵的检测，涉及聚合每个p的状态
+现在还没有细节
+
+*/
+LockOSThread
+
+This functionality is not performance-critical.
+1. Locked G become non-runnable (Gwaiting). M instantly returns P to idle list, wakes up another M and blocks.
+2. Locked G becomes runnable (and reaches head of the runq). Current M hands off own P and locked G to the M associated with the locked G, and unblocks it. Current M becomes idle.
+/*
+这个功能不是性能关键点
+1 锁住的G变为不可运行。这个M马上把P放回空闲队列，放弃P，唤醒另一个M，自己陷入阻塞。
+2 锁住的G变为可以运行。不会翻译了。。。。
+
+*/
+Idle G
+
+This functionality is not performance-critical.
+There is a global queue of (or a single?) idle G. An M that looks for work checks the queue after several unsuccessful steal attempts.
+/*
+有个全局的空闲G
+M寻找工作中会在几次不成功的偷取后检查全局队列来获取G【看源码是先全局，再偷取】
+*/
+
+Implementation Plan
+
+The goal is to split the whole thing into minimal parts that can be independently reviewed and submitted.
+1. Introduce the P struct (empty for now); implement allp/idlep containers (idlep is mutex-protected for starters); associate a P with M running Go code. Global mutex and atomic state is still preserved.
+2. Move G freelist to P.
+3. Move mcache to P.
+4. Move stackalloc to P.
+5. Move ncgocall/gcstats to P.
+6. Decentralize run queue, implement work-stealing. Eliminate G hand off. Still under global mutex.
+7. Remove global mutex, implement distributed termination detection, LockOSThread.
+8. Implement spinning instead of prompt blocking/unblocking.
+The plan may turn out to not work, there are a lot of unexplored details.
+/*
+实现计划
+目标是把整个东西分隔为更小的部分，更小的部分可以独立的review和提交
+1 引入p。全局锁和原子状态仍然保留，在这一步
+2
+*/
+
+Potential Further Improvements
+
+1. Try out LIFO scheduling, this will improve locality. However, it still must provide some degree of fairness and gracefully handle yielding goroutines.
+2. Do not allocate G and stack until the goroutine first runs. For a newly created goroutine we need just callerpc, fn, narg, nret and args, that is, about 6 words. This will allow to create a lot of running-to-completion goroutines with significantly lower memory overhead.
+4. Better locality of G-to-P. Try to enqueue an unblocked G to a P on which it was last running.
+5. Better locality of P-to-M. Try to execute P on the same M it was last running.
+6. Throttling of M creation. The scheduler can be easily forced to create thousands of M's per second until OS refuses to create more threads. M’s must be created promptly up to k*GOMAXPROCS, after that new M’s may added by a timer.
+/*
+未来展望
+
+1 实现后进先出的调度，提高局部性，。然而这么做的话，必须提供某种公平性和优雅屈服的G
+2 在G运行之前不要分配栈
+*/
+Random Notes
+
+- GOMAXPROCS won’t go away as a result of this work.
+
+

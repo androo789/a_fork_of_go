@@ -210,7 +210,10 @@ func efaceOf(ep *interface{}) *eface {
 // which can lead to a half-executed write barrier that has marked the object
 // but not queued it. If the GC skips the object and completes before the
 // queuing can occur, it will incorrectly free the object.
+///*
+//~ 这几个ptr指针类型，都是为了通过写屏障，说起写屏障，这又是gc的专业的领域，我又忘了
 //
+//*/
 // We tried using special assignment functions invoked only when not
 // holding a running P, but then some updates to a particular memory
 // word went through write barriers and some did not. This breaks the
@@ -312,6 +315,7 @@ type gobuf struct {
 	// and restores it doesn't need write barriers. It's still
 	// typed as a pointer so that any other writes from Go get
 	// write barriers.
+	//~ go运行时需要的sp pc等等寄存器
 	sp   uintptr
 	pc   uintptr
 	g    guintptr
@@ -331,17 +335,22 @@ type gobuf struct {
 //
 // sudogs are allocated from a special pool. Use acquireSudog and
 // releaseSudog to allocate and free them.
+//~sudog是等待中的一个g，用于chan，一个等待的g
 type sudog struct {
 	// The following fields are protected by the hchan.lock of the
 	// channel this sudog is blocking on. shrinkstack depends on
 	// this for sudogs involved in channel ops.
 
+	//~指向当前的 goroutine。
 	g *g
 
 	// isSelect indicates g is participating in a select, so
 	// g.selectDone must be CAS'd to win the wake-up race.
 	isSelect bool
+
+	//~指向下一个 g。
 	next     *sudog
+	//~指向上一个 g。
 	prev     *sudog
 	elem     unsafe.Pointer // data element (may point to stack)
 
@@ -379,6 +388,7 @@ type wincallbackcontext struct {
 // Stack describes a Go execution stack.
 // The bounds of the stack are exactly [lo, hi),
 // with no implicit data structures on either side.
+//~ go运行时使用的栈地址
 type stack struct {
 	lo uintptr
 	hi uintptr
@@ -449,6 +459,7 @@ type g struct {
 	gcAssistBytes int64
 }
 
+//~ os 线程
 type m struct {
 	g0      *g     // goroutine with scheduling stack
 	morebuf gobuf  // gobuf arg to morestack
@@ -461,9 +472,9 @@ type m struct {
 	sigmask       sigset       // storage for saved signal mask
 	tls           [6]uintptr   // thread-local storage (for x86 extern register)
 	mstartfn      func()
-	curg          *g       // current running goroutine
+	curg          *g       //~ current running goroutine  正在运行的g
 	caughtsig     guintptr // goroutine running during fatal signal
-	p             puintptr // attached p for executing go code (nil if not executing go code)
+	p             puintptr //~ attached p for executing go code (nil if not executing go code)  关联的P
 	nextp         puintptr
 	oldp          puintptr // the p that was attached before executing a syscall
 	id            int64
@@ -520,6 +531,7 @@ type m struct {
 	mOS
 }
 
+//~逻辑处理器
 type p struct {
 	id          int32
 	status      uint32 // one of pidle/prunning/...
@@ -538,10 +550,10 @@ type p struct {
 	goidcache    uint64
 	goidcacheend uint64
 
-	// Queue of runnable goroutines. Accessed without lock.
+	//~ Queue of runnable goroutines. Accessed without lock. p的本地队列
 	runqhead uint32
 	runqtail uint32
-	runq     [256]guintptr
+	runq     [256]guintptr //~ 一个头一个尾，一个队列本身。长度256
 	// runnext, if non-nil, is a runnable G that was ready'd by
 	// the current G and should be run next instead of what's in
 	// runq if there's time remaining in the running G's time
@@ -601,6 +613,7 @@ type p struct {
 	pad cpu.CacheLinePad
 }
 
+//~我草还真有一个调度器对象，我还以为没有呢
 type schedt struct {
 	// accessed atomically. keep at top to ensure alignment on 32-bit systems.
 	goidgen  uint64
@@ -611,11 +624,11 @@ type schedt struct {
 	// When increasing nmidle, nmidlelocked, nmsys, or nmfreed, be
 	// sure to call checkdead().
 
-	midle        muintptr // idle m's waiting for work
+	midle        muintptr //~ idle m's waiting for work  空闲的m
 	nmidle       int32    // number of idle m's waiting for work
 	nmidlelocked int32    // number of locked m's waiting for work
 	mnext        int64    // number of m's that have been created and next M ID
-	maxmcount    int32    // maximum number of m's allowed (or die)
+	maxmcount    int32    //~ maximum number of m's allowed (or die) 理论上最大的M的数量
 	nmsys        int32    // number of system m's not counted for deadlock
 	nmfreed      int64    // cumulative number of freed m's
 
@@ -625,7 +638,7 @@ type schedt struct {
 	npidle     uint32
 	nmspinning uint32 // See "Worker thread parking/unparking" comment in proc.go.
 
-	// Global runnable queue.
+	//~ Global runnable queue. 全局队列
 	runq     gQueue
 	runqsize int32
 
@@ -910,11 +923,11 @@ func (w waitReason) String() string {
 
 var (
 	allglen    uintptr
-	allm       *m
-	allp       []*p  // len(allp) == gomaxprocs; may change at safe points, otherwise immutable
+	allm       *m    //~ 明明是一个m为什么是全部m呢
+	allp       []*p  //~ len(allp) == gomaxprocs; may change at safe points, otherwise immutable 保存了所有p
 	allpLock   mutex // Protects P-less reads of allp and all writes
 	gomaxprocs int32
-	ncpu       int32
+	ncpu       int32 //~cpu核数
 	forcegc    forcegcstate
 	sched      schedt
 	newprocs   int32

@@ -80,6 +80,9 @@ type uint uint
 
 // uintptr is an integer type that is large enough to hold the bit pattern of
 // any pointer.
+//~32 位系统中，unitptr 代表 uint32，占 4 字节，
+//~64 位系统中，unitptr 代表 uint64，占 8 字节，
+//考虑了机器的情况
 type uintptr uintptr
 
 // byte is an alias for uint8 and is equivalent to uint8 in all ways. It is
